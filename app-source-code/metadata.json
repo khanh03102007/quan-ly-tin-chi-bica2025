@@ -1,0 +1,6 @@
+{
+  "name": "Theo Dõi Tín Chỉ BICA 2025",
+  "description": "Hệ thống theo dõi tín chỉ, thời khóa biểu, điểm số, học phí và công cụ dự báo GPA (What-if) cho sinh viên BICA 2025 kết nối Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
