@@ -48,6 +48,8 @@ import {
   updateStudentAccountPassword,
   consumeInitialRecoveryRedirect,
   clearActiveRecoverySession,
+  hashStudentPasswordSync,
+  verifyStudentPasswordHash,
 } from '../lib/supabase';
 import type { TeacherAccount, StudentProfile } from '../types';
 
@@ -58,14 +60,15 @@ export interface GatewayAuthScreenProps {
   onToggleTheme?: () => void;
 }
 
-// Khóa lưu danh bạ tài khoản sinh viên đã đăng ký trên máy
+// Khóa lưu danh bạ tài khoản sinh viên đã đăng ký trên máy (chỉ lưu mã băm Salted Hash, tuyệt đối không lưu mật khẩu plaintext)
 const BICA_REGISTERED_STUDENTS_STORAGE_KEY = 'bica_registered_students_v1';
 
 interface RegisteredLocalStudent {
   email: string;
   studentId: string;
   fullName: string;
-  password: string;
+  passwordHash?: string;
+  password?: string;
   profile: StudentProfile;
   createdAt: string;
 }
@@ -73,13 +76,37 @@ interface RegisteredLocalStudent {
 function getStoredRegisteredStudents(): RegisteredLocalStudent[] {
   try {
     const raw = localStorage.getItem(BICA_REGISTERED_STUDENTS_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    if (!raw) return [];
+    const parsed: RegisteredLocalStudent[] = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    let needsMigration = false;
+    const migrated = parsed.map((item) => {
+      if (item && typeof item.password === 'string' && item.password) {
+        needsMigration = true;
+        const hash = hashStudentPasswordSync(item.email, item.password);
+        const { password, ...rest } = item;
+        return { ...rest, passwordHash: hash };
+      }
+      return item;
+    });
+    if (needsMigration) {
+      localStorage.setItem(BICA_REGISTERED_STUDENTS_STORAGE_KEY, JSON.stringify(migrated));
+    }
+    return migrated;
   } catch {
     return [];
   }
 }
 
-function saveRegisteredStudentToLocal(account: RegisteredLocalStudent) {
+function saveRegisteredStudentToLocal(account: {
+  email: string;
+  studentId: string;
+  fullName: string;
+  password?: string;
+  passwordHash?: string;
+  profile: StudentProfile;
+  createdAt: string;
+}) {
   try {
     const current = getStoredRegisteredStudents();
     const filtered = current.filter(
@@ -87,7 +114,17 @@ function saveRegisteredStudentToLocal(account: RegisteredLocalStudent) {
         a.email.toLowerCase() !== account.email.toLowerCase() &&
         a.studentId.toUpperCase() !== account.studentId.toUpperCase()
     );
-    filtered.push(account);
+    const passwordHash =
+      account.passwordHash ||
+      (account.password ? hashStudentPasswordSync(account.email, account.password) : '');
+    filtered.push({
+      email: account.email.trim().toLowerCase(),
+      studentId: account.studentId.trim().toUpperCase(),
+      fullName: account.fullName.trim(),
+      passwordHash,
+      profile: account.profile,
+      createdAt: account.createdAt,
+    });
     localStorage.setItem(BICA_REGISTERED_STUDENTS_STORAGE_KEY, JSON.stringify(filtered));
   } catch (err) {
     console.error('Lỗi lưu tài khoản đăng ký cục bộ:', err);
@@ -201,10 +238,8 @@ export const GatewayAuthScreen: React.FC<GatewayAuthScreenProps> = ({
   const [teacherError, setTeacherError] = useState<string | null>(null);
   const [isTeacherLoading, setIsTeacherLoading] = useState(false);
 
-  // Tự động đồng bộ danh sách sinh viên và kiểm tra nếu học sinh truy cập từ link khôi phục mật khẩu trong Gmail
+  // Kiểm tra nếu học sinh truy cập từ link khôi phục mật khẩu trong Gmail (Không tải danh sách toàn bộ SV khi chưa xác thực Chủ nhiệm ngành)
   useEffect(() => {
-    fetchAllStudentsForTeacher().catch(() => {});
-
     consumeInitialRecoveryRedirect().then((res) => {
       if (!res.isRedirect) return;
       setActivePortal('student');
@@ -489,12 +524,12 @@ export const GatewayAuthScreen: React.FC<GatewayAuthScreenProps> = ({
         return;
       }
 
-      // 2. Kiểm tra với danh sách tài khoản đã đăng ký trên hệ thống
+      // 2. Kiểm tra với danh sách tài khoản đã đăng ký trên hệ thống (so khớp mã băm Salted Hash)
       const registeredList = getStoredRegisteredStudents();
       const matchedLocal = registeredList.find(
         (acc) =>
           acc.email.toLowerCase() === inputClean &&
-          acc.password === passClean
+          verifyStudentPasswordHash(acc.email, passClean, acc)
       );
 
       if (matchedLocal) {

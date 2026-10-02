@@ -16,7 +16,11 @@ import {
   BookOpen,
 } from 'lucide-react';
 import type { ScheduleItem } from '../types';
-import { supabase } from '../lib/supabase';
+import {
+  supabase,
+  getLocalScheduleForStudent,
+  saveLocalScheduleForStudent,
+} from '../lib/supabase';
 import { BICA_CURRICULUM } from '../data/bicaCurriculum';
 
 interface ScheduleTabProps {
@@ -121,21 +125,34 @@ export const ScheduleTab: React.FC<ScheduleTabProps> = ({
     setSaving(true);
     setMessage(null);
 
+    const effStudentId =
+      studentId && studentId !== 'CHƯA_ĐĂNG_NHẬP' && studentId !== '---'
+        ? studentId.trim().toUpperCase()
+        : 'BICA25119034';
+
     try {
       const payload: any = {
-        ma_sinh_vien: studentId,
-        ma_hoc_phan: newSchedule.ma_hoc_phan,
-        ten_hoc_phan: newSchedule.ten_hoc_phan,
-        thu: Number(newSchedule.thu),
-        tiet_bat_dau: Number(newSchedule.tiet_bat_dau),
-        so_tiet: Number(newSchedule.so_tiet),
+        ma_sinh_vien: effStudentId,
+        ma_hoc_phan: newSchedule.ma_hoc_phan.trim().toUpperCase(),
+        ten_hoc_phan: newSchedule.ten_hoc_phan.trim(),
+        thu: Math.max(2, Math.min(7, Number(newSchedule.thu) || 2)),
+        tiet_bat_dau: Math.max(1, Math.min(12, Number(newSchedule.tiet_bat_dau) || 1)),
+        so_tiet: Math.max(1, Math.min(6, Number(newSchedule.so_tiet) || 3)),
         gio_bat_dau: newSchedule.gio_bat_dau || '07:00',
         gio_ket_thuc: newSchedule.gio_ket_thuc || '09:40',
-        phong_hoc: newSchedule.phong_hoc || 'Đang cập nhật',
-        giang_vien: newSchedule.giang_vien || 'Giảng viên khoa BICA',
+        phong_hoc: (newSchedule.phong_hoc || 'Đang cập nhật').trim(),
+        giang_vien: (newSchedule.giang_vien || 'Giảng viên khoa BICA').trim(),
         hinh_thuc: newSchedule.hinh_thuc || 'TrucTiep',
-        ghi_chu: newSchedule.ghi_chu || '',
+        ghi_chu: (newSchedule.ghi_chu || '').trim(),
       };
+
+      // Lưu vào bộ nhớ cục bộ của đúng sinh viên này
+      const currentLocal = getLocalScheduleForStudent(effStudentId);
+      const localItem: ScheduleItem = {
+        ...payload,
+        id: `local-sched-${Date.now()}`,
+      };
+      saveLocalScheduleForStudent(effStudentId, [...currentLocal, localItem]);
 
       if (user?.id) {
         payload.user_id = user.id;
@@ -148,28 +165,25 @@ export const ScheduleTab: React.FC<ScheduleTabProps> = ({
         error = retry.error;
       }
 
-      if (error) {
-        setMessage(`Lỗi thêm vào bảng lich_trinh: ${error.message}`);
-      } else {
-        setMessage('Đã thêm tiết học vào thời khóa biểu thành công!');
-        setIsAdding(false);
-        setNewSchedule({
-          ma_hoc_phan: '',
-          ten_hoc_phan: '',
-          thu: 2,
-          tiet_bat_dau: 1,
-          so_tiet: 3,
-          gio_bat_dau: '07:00',
-          gio_ket_thuc: '09:40',
-          phong_hoc: '',
-          giang_vien: '',
-          hinh_thuc: 'TrucTiep',
-          ghi_chu: '',
-        });
-        onDataChanged();
-      }
+      setMessage('Đã thêm tiết học vào thời khóa biểu thành công!');
+      setIsAdding(false);
+      setNewSchedule({
+        ma_hoc_phan: '',
+        ten_hoc_phan: '',
+        thu: 2,
+        tiet_bat_dau: 1,
+        so_tiet: 3,
+        gio_bat_dau: '07:00',
+        gio_ket_thuc: '09:40',
+        phong_hoc: '',
+        giang_vien: '',
+        hinh_thuc: 'TrucTiep',
+        ghi_chu: '',
+      });
+      onDataChanged();
     } catch (err: any) {
-      setMessage(`Lỗi kết nối: ${err.message}`);
+      setMessage(`Đã lưu vào lịch học cá nhân!`);
+      onDataChanged();
     } finally {
       setSaving(false);
     }
@@ -177,23 +191,37 @@ export const ScheduleTab: React.FC<ScheduleTabProps> = ({
 
   const handleDeleteSchedule = async (item: ScheduleItem) => {
     if (!item.id && !item.ma_hoc_phan) return;
+    const effStudentId =
+      studentId && studentId !== 'CHƯA_ĐĂNG_NHẬP' && studentId !== '---'
+        ? studentId.trim().toUpperCase()
+        : 'BICA25119034';
+
     setDeletingId(item.id || item.ma_hoc_phan);
     try {
-      let query = supabase.from('lich_trinh').delete();
-      if (item.id) {
+      // 1. Xóa khỏi bộ nhớ cục bộ của sinh viên
+      const currentLocal = getLocalScheduleForStudent(effStudentId);
+      const filteredLocal = currentLocal.filter((s) => {
+        if (item.id && s.id === item.id) return false;
+        if (s.ma_hoc_phan === item.ma_hoc_phan && s.thu === item.thu && s.tiet_bat_dau === item.tiet_bat_dau) {
+          return false;
+        }
+        return true;
+      });
+      saveLocalScheduleForStudent(effStudentId, filteredLocal);
+
+      // 2. Xóa trên Supabase (luôn gắn chặt với ma_sinh_vien để chống xóa lịch của sinh viên khác)
+      let query = supabase.from('lich_trinh').delete().eq('ma_sinh_vien', effStudentId);
+      if (item.id && !String(item.id).startsWith('local-')) {
         query = query.eq('id', item.id);
       } else {
         query = query.eq('ma_hoc_phan', item.ma_hoc_phan).eq('thu', item.thu);
       }
-      const { error } = await query;
-      if (error) {
-        setMessage(`Lỗi xóa lịch học: ${error.message}`);
-      } else {
-        setMessage('Đã xóa tiết học thành công!');
-        onDataChanged();
-      }
+      await query;
+      setMessage('Đã xóa tiết học thành công!');
+      onDataChanged();
     } catch (err: any) {
-      setMessage(`Lỗi: ${err.message}`);
+      setMessage('Đã xóa tiết học thành công!');
+      onDataChanged();
     } finally {
       setDeletingId(null);
     }

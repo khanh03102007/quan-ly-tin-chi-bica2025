@@ -82,6 +82,13 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     details?: string;
   } | null>(null);
 
+  const isAuthenticated = Boolean(
+    user ||
+      (profile?.ma_sinh_vien &&
+        profile.ma_sinh_vien !== '---' &&
+        profile.ma_sinh_vien !== 'CHƯA_ĐĂNG_NHẬP')
+  );
+
   // Cập nhật form state khi profile hoặc user thay đổi
   useEffect(() => {
     setFormData(profile);
@@ -156,9 +163,14 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     setSaving(true);
     setSaveStatus(null);
 
-    // Khóa cứng các chỉ số học vụ: Luôn lấy từ kết quả tự động đồng bộ của Bảng điểm & Tín chỉ, không cho sinh viên tự sửa
+    // Khóa cứng mã sinh viên gốc và các chỉ số học vụ: Không cho phép đổi MSSV sang tài khoản sinh viên khác hoặc tự sửa điểm GPA/CPA
+    const lockedStudentId =
+      profile.ma_sinh_vien && profile.ma_sinh_vien !== '---' && profile.ma_sinh_vien !== 'CHƯA_ĐĂNG_NHẬP'
+        ? profile.ma_sinh_vien
+        : formData.ma_sinh_vien;
     const syncedPayload: StudentProfile = {
       ...formData,
+      ma_sinh_vien: lockedStudentId,
       tong_tin_chi_tich_luy: academicMetrics.accumulatedCredits,
       diem_gpa: academicMetrics.latestSemesterGpa,
       diem_cpa: academicMetrics.cpa,
@@ -206,7 +218,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
           <div className="flex items-start sm:items-center space-x-4">
             <div className="w-14 h-14 rounded-lg bg-slate-900 text-white flex items-center justify-center text-xl font-bold font-mono shrink-0 border border-slate-700">
-              {user ? (
+              {isAuthenticated ? (
                 profile.ho_va_ten?.charAt(0) || 'S'
               ) : (
                 <User className="w-7 h-7 text-slate-300" />
@@ -215,25 +227,25 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
             <div>
               <div className="flex items-center space-x-2 flex-wrap gap-y-1">
                 <h1 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">
-                  {user ? (profile.ho_va_ten || 'Sinh viên BICA') : 'Chưa đăng nhập'}
+                  {isAuthenticated ? (profile.ho_va_ten || 'Sinh viên BICA') : 'Chưa đăng nhập'}
                 </h1>
                 <span className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
-                  user
+                  isAuthenticated
                     ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
                     : 'bg-amber-50 text-amber-800 border-amber-300'
                 }`}>
-                  {user ? (profile.trang_thai_hoc_tap || 'Đang học') : 'Chưa đăng nhập'}
+                  {isAuthenticated ? (profile.trang_thai_hoc_tap || 'Đang học') : 'Chưa đăng nhập'}
                 </span>
-                {user?.email && (
+                {(user?.email || profile?.email) && (
                   <span className="px-2 py-0.5 rounded text-[11px] font-mono text-slate-600 bg-slate-100 border border-slate-200">
-                    {user.email}
+                    {user?.email || profile.email}
                   </span>
                 )}
               </div>
               <div className="text-xs text-slate-600 mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                <span>MSSV: <strong className="font-mono text-slate-900">{user ? (profile.ma_sinh_vien || '---') : '---'}</strong></span>
+                <span>MSSV: <strong className="font-mono text-slate-900">{isAuthenticated ? (profile.ma_sinh_vien || '---') : '---'}</strong></span>
                 <span className="text-slate-300">•</span>
-                <span>Lớp: <strong className="text-slate-900">{user ? (profile.lop || 'BICA-K2025') : 'BICA-K2025'}</strong></span>
+                <span>Lớp: <strong className="text-slate-900">{isAuthenticated ? (profile.lop || 'BICA-K2025') : 'BICA-K2025'}</strong></span>
                 <span className="text-slate-300">•</span>
                 <span>Niên khóa: <strong className="text-slate-900">{profile.nien_khoa || '2025 - 2029'}</strong></span>
               </div>
@@ -246,9 +258,9 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
           <div className="flex flex-wrap items-center gap-2 pt-2 md:pt-0 border-t md:border-t-0 border-slate-100">
             <div className="flex items-center space-x-1.5 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-md text-xs text-slate-700">
               <Database className="w-3.5 h-3.5 text-blue-600" />
-              <span>{user && isSupabaseLive ? 'CSDL Máy chủ Kết nối' : 'Phiên bảo mật'}</span>
+              <span>{isAuthenticated && isSupabaseLive ? 'CSDL Máy chủ Kết nối' : 'Phiên bảo mật'}</span>
             </div>
-            {user ? (
+            {isAuthenticated ? (
               <button
                 id="btn-edit-profile"
                 onClick={() => {
@@ -275,7 +287,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
       </div>
 
       {/* Thông báo khi chưa đăng nhập */}
-      {!user && (
+      {!isAuthenticated && (
         <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-900 shadow-xs">
           <div className="flex items-start space-x-3">
             <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
@@ -373,14 +385,16 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
             <div>
-              <label className="font-semibold text-slate-700 block mb-1">Mã sinh viên (MSSV)</label>
+              <label className="font-semibold text-slate-700 block mb-1">Mã sinh viên (MSSV - Khóa định danh)</label>
               <input
                 type="text"
                 required
+                readOnly={Boolean(profile.ma_sinh_vien && profile.ma_sinh_vien !== '---')}
                 value={formData.ma_sinh_vien}
                 onChange={(e) => setFormData({ ...formData, ma_sinh_vien: e.target.value })}
                 placeholder="VD: 25119001 hoặc BICA25119001"
-                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:ring-2 focus:ring-blue-500 font-mono font-semibold text-slate-800"
+                className="w-full px-3 py-2 bg-slate-100 border border-slate-200 rounded-lg font-mono font-semibold text-slate-700 cursor-not-allowed"
+                title="Mã số sinh viên được khóa bảo mật theo tài khoản đăng nhập"
               />
             </div>
             <div>
@@ -466,7 +480,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
           </div>
           <div className="mt-3 flex items-baseline space-x-2">
             <span className="text-3xl font-extrabold text-slate-900">
-              {user ? credits : 0}
+              {isAuthenticated ? credits : 0}
             </span>
             <span className="text-sm font-medium text-slate-500">
               / {totalCredits} TC
@@ -476,11 +490,11 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
             <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
               <div
                 className="bg-blue-600 h-2 rounded-full transition-all duration-500"
-                style={{ width: `${user ? completionPercent : 0}%` }}
+                style={{ width: `${isAuthenticated ? completionPercent : 0}%` }}
               />
             </div>
             <p className="text-[11px] text-slate-500 mt-1 font-medium">
-              {user ? `Hoàn thành ${completionPercent}% chương trình cử nhân BICA` : 'Vui lòng đăng nhập để xem tiến độ'}
+              {isAuthenticated ? `Hoàn thành ${completionPercent}% chương trình cử nhân BICA` : 'Vui lòng đăng nhập để xem tiến độ'}
             </p>
           </div>
         </div>
@@ -545,14 +559,14 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
 
           <div className="flex items-baseline space-x-2">
             <span className="text-3xl font-extrabold text-slate-900">
-              {user && currentSemesterSummary.gradedCredits > 0 ? gpa.toFixed(2) : '---'}
+              {isAuthenticated && currentSemesterSummary.gradedCredits > 0 ? gpa.toFixed(2) : '---'}
             </span>
             <span className="text-xs font-semibold px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800">
               Hệ 4.0
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-2 font-medium">
-            {user && currentSemesterSummary.gradedCredits > 0
+            {isAuthenticated && currentSemesterSummary.gradedCredits > 0
               ? `Hệ 10: ~${currentSemesterSummary.gpa10.toFixed(1)}/10 (${currentSemesterSummary.gradedCredits} TC có điểm)`
               : `Chưa có môn chấm điểm ở ${selectedSemester}`}
           </p>
@@ -570,14 +584,14 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
           </div>
           <div className="mt-3 flex items-baseline space-x-2">
             <span className="text-3xl font-extrabold text-slate-900">
-              {user && academicMetrics.hasGradedCourses ? cpa.toFixed(2) : '---'}
+              {isAuthenticated && academicMetrics.hasGradedCourses ? cpa.toFixed(2) : '---'}
             </span>
             <span className="text-xs font-semibold px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800">
               CPA
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-3 font-medium">
-            {user && academicMetrics.hasGradedCourses
+            {isAuthenticated && academicMetrics.hasGradedCourses
               ? 'Tự động đồng bộ từ toàn bộ học phần đã có điểm'
               : 'Chưa có dữ liệu điểm tích lũy'}
           </p>
@@ -595,11 +609,11 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
           </div>
           <div className="mt-3 flex items-baseline space-x-2">
             <span className="text-3xl font-extrabold text-slate-900">
-              {user ? syncedAcademicRank : 'Chưa xếp loại'}
+              {isAuthenticated ? syncedAcademicRank : 'Chưa xếp loại'}
             </span>
           </div>
           <p className="text-[11px] text-slate-500 mt-3 font-medium">
-            {user ? 'Tự động xếp loại theo CPA bảng điểm thực tế' : 'Đăng nhập để cập nhật xếp loại'}
+            {isAuthenticated ? 'Tự động xếp loại theo CPA bảng điểm thực tế' : 'Đăng nhập để cập nhật xếp loại'}
           </p>
         </div>
       </div>
@@ -768,17 +782,17 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-4 gap-x-6 text-sm">
             <div className="flex flex-col py-2 border-b border-slate-100">
               <span className="text-xs font-medium text-slate-500">Họ và tên</span>
-              <span className="font-semibold text-slate-800 mt-0.5">{user ? profile.ho_va_ten : 'Chưa đăng nhập'}</span>
+              <span className="font-semibold text-slate-800 mt-0.5">{isAuthenticated ? profile.ho_va_ten : 'Chưa đăng nhập'}</span>
             </div>
 
             <div className="flex flex-col py-2 border-b border-slate-100">
               <span className="text-xs font-medium text-slate-500">Mã số sinh viên (MSSV)</span>
-              <span className="font-semibold font-mono text-blue-600 mt-0.5">{user ? profile.ma_sinh_vien : '---'}</span>
+              <span className="font-semibold font-mono text-blue-600 mt-0.5">{isAuthenticated ? profile.ma_sinh_vien : '---'}</span>
             </div>
 
             <div className="flex flex-col py-2 border-b border-slate-100">
               <span className="text-xs font-medium text-slate-500">Lớp sinh hoạt</span>
-              <span className="font-semibold text-slate-800 mt-0.5">{user ? profile.lop : 'BICA-K2025'}</span>
+              <span className="font-semibold text-slate-800 mt-0.5">{isAuthenticated ? profile.lop : 'BICA-K2025'}</span>
             </div>
 
             <div className="flex flex-col py-2 border-b border-slate-100">
@@ -806,7 +820,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
               <span className="text-xs font-medium text-slate-500">Email trường</span>
               <span className="font-medium text-slate-800 mt-0.5 flex items-center gap-1.5">
                 <Mail className="w-3.5 h-3.5 text-slate-400" />
-                {user ? (profile.email || user.email) : 'Chưa đăng nhập'}
+                {isAuthenticated ? (profile.email || user?.email) : 'Chưa đăng nhập'}
               </span>
             </div>
 
@@ -814,12 +828,12 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
               <span className="text-xs font-medium text-slate-500">Số điện thoại liên hệ</span>
               <span className="font-medium text-slate-800 mt-0.5 flex items-center gap-1.5">
                 <Phone className="w-3.5 h-3.5 text-slate-400" />
-                {user ? (profile.so_dien_thoai || 'Chưa cập nhật') : '---'}
+                {isAuthenticated ? (profile.so_dien_thoai || 'Chưa cập nhật') : '---'}
               </span>
             </div>
           </div>
 
-          {!user && (
+          {!isAuthenticated && (
             <div className="mt-4 p-3.5 bg-blue-50/80 border border-blue-200/80 rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <span className="text-blue-950 font-medium">
                 Vui lòng đăng nhập bằng tài khoản sinh viên của bạn để xem và chỉnh sửa hồ sơ cá nhân.

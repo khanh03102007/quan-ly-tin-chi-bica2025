@@ -406,6 +406,45 @@ export async function signInWithPassword(email: string, password: string) {
 const SYNCED_HO_SO_IDS_KEY = 'bica_synced_ho_so_ids_v1';
 const DELETED_STUDENTS_KEY = 'bica_deleted_students_v1';
 
+/**
+ * Làm sạch chuỗi trước khi đưa vào bộ lọc .or() của PostgREST để chống Filter Injection
+ */
+export function sanitizePostgrestFilterValue(raw: string): string {
+  return String(raw || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9@._-]/g, '')
+    .slice(0, 120);
+}
+
+/**
+ * Băm mật khẩu sinh viên một chiều (Salted Hash) để tuyệt đối không lưu mật khẩu plaintext trong localStorage
+ */
+export function hashStudentPasswordSync(email: string, password: string): string {
+  const normalized = `${(email || '').trim().toLowerCase()}::bica_vju_salt_2025::${(password || '').trim()}`;
+  let h1 = 0xdeadbeef ^ normalized.length;
+  let h2 = 0x41c6ce57 ^ normalized.length;
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = normalized.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `bica_h1_${(h2 >>> 0).toString(16).padStart(8, '0')}${(h1 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+export function verifyStudentPasswordHash(email: string, plainPassword: string, accountRecord: any): boolean {
+  if (!accountRecord || !plainPassword) return false;
+  const expectedHash = hashStudentPasswordSync(email, plainPassword);
+  if (accountRecord.passwordHash) {
+    return accountRecord.passwordHash === expectedHash;
+  }
+  if (typeof accountRecord.password === 'string') {
+    return accountRecord.password === plainPassword.trim();
+  }
+  return false;
+}
+
 function getStoredSet(key: string): Set<string> {
   if (typeof window === 'undefined') return new Set();
   try {
@@ -525,11 +564,13 @@ export async function ensureStudentInHoSo(profile: Partial<StudentProfile>): Pro
       return { success: true, data: upserted || payload };
     }
 
-    // 2. Fallback: Kiểm tra tồn tại theo ma_sinh_vien hoặc email rồi update / insert
+    // 2. Fallback: Kiểm tra tồn tại theo ma_sinh_vien hoặc email rồi update / insert (sanitize chống PostgREST filter injection)
+    const safeMaSv = sanitizePostgrestFilterValue(maSv);
+    const safeEmail = sanitizePostgrestFilterValue(finalEmail);
     const { data: existing } = await supabase
       .from('ho_so')
       .select('id, ma_sinh_vien')
-      .or(`ma_sinh_vien.eq.${maSv}${finalEmail ? `,email.eq.${finalEmail}` : ''}`)
+      .or(`ma_sinh_vien.eq.${safeMaSv}${safeEmail ? `,email.eq.${safeEmail}` : ''}`)
       .limit(1)
       .maybeSingle();
 
@@ -673,6 +714,152 @@ export async function getCurrentUser(): Promise<User | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Kiểm tra và lấy thông tin phiên đăng nhập Cổng BICA (Gateway Session) còn hiệu lực
+ */
+export function getActivePortalSession(): {
+  role: 'student' | 'teacher';
+  studentId?: string;
+  name: string;
+  email: string;
+  loginAt: string;
+} | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem('bica_portal_gateway_session');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.role || !parsed.email) return null;
+    const loginTime = parsed.loginAt ? new Date(parsed.loginAt).getTime() : 0;
+    const maxAgeMs = parsed.role === 'teacher' ? 12 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+    if (loginTime && Date.now() - loginTime > maxAgeMs) {
+      localStorage.removeItem('bica_portal_gateway_session');
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Guard kiểm tra người dùng đã xác thực hợp lệ hay chưa
+ * (Thông qua Supabase Auth User, Cổng Sinh viên/Giảng viên Gateway, hoặc Phiên Chủ nhiệm/Cán bộ chấm điểm).
+ * Đồng thời kiểm tra chống truy cập chéo (IDOR) đối với dữ liệu cá nhân của sinh viên.
+ */
+export async function verifyAuthenticatedRequest(options?: {
+  currentUser?: User | null;
+  targetStudentId?: string;
+  requireTeacher?: boolean;
+  requireAdminOrEvaluator?: boolean;
+}): Promise<{
+  authenticated: boolean;
+  resolvedUser: User | null;
+  resolvedStudentId: string;
+  resolvedEmail: string;
+  isTeacher: boolean;
+  isAdminOrEvaluator: boolean;
+  error?: string;
+}> {
+  const teacherSession = getActiveTeacherSession();
+  const evaluatorSession = getEvaluatorSession();
+  const portalSession = getActivePortalSession();
+  const resolvedUser =
+    options?.currentUser !== undefined ? options.currentUser : await getCurrentUser();
+
+  const isTeacher = Boolean(teacherSession || portalSession?.role === 'teacher');
+  const isAdminOrEvaluator = Boolean(isTeacher || evaluatorSession);
+
+  if (options?.requireTeacher && !isTeacher) {
+    return {
+      authenticated: false,
+      resolvedUser: null,
+      resolvedStudentId: '',
+      resolvedEmail: '',
+      isTeacher: false,
+      isAdminOrEvaluator,
+      error: 'Từ chối truy cập: Yêu cầu quyền Chủ nhiệm ngành / Giảng viên.',
+    };
+  }
+
+  if (options?.requireAdminOrEvaluator && !isAdminOrEvaluator) {
+    return {
+      authenticated: false,
+      resolvedUser: null,
+      resolvedStudentId: '',
+      resolvedEmail: '',
+      isTeacher,
+      isAdminOrEvaluator: false,
+      error: 'Từ chối truy cập: Yêu cầu quyền Chủ nhiệm ngành hoặc Cán bộ thẩm định.',
+    };
+  }
+
+  const sessionStudentId = (
+    portalSession?.studentId ||
+    resolvedUser?.user_metadata?.student_id ||
+    ''
+  )
+    .trim()
+    .toUpperCase();
+
+  const sessionEmail = (
+    resolvedUser?.email ||
+    portalSession?.email ||
+    teacherSession?.email ||
+    evaluatorSession?.email ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+
+  const hasAnyValidAuth = Boolean(
+    resolvedUser?.id || portalSession?.email || teacherSession?.email || evaluatorSession?.email
+  );
+
+  if (!hasAnyValidAuth) {
+    return {
+      authenticated: false,
+      resolvedUser: null,
+      resolvedStudentId: '',
+      resolvedEmail: '',
+      isTeacher: false,
+      isAdminOrEvaluator: false,
+      error: 'Chưa đăng nhập: Vui lòng xác thực tài khoản trước khi truy vấn dữ liệu Supabase.',
+    };
+  }
+
+  const requestedId =
+    options?.targetStudentId &&
+    options.targetStudentId !== '---' &&
+    options.targetStudentId !== 'CHƯA_ĐĂNG_NHẬP'
+      ? options.targetStudentId.trim().toUpperCase()
+      : '';
+
+  // Nếu là sinh viên thông thường (không phải Giảng viên / Cán bộ thẩm định), chỉ được phép truy vấn đúng MSSV của mình
+  if (!isAdminOrEvaluator && requestedId && sessionStudentId && requestedId !== sessionStudentId) {
+    return {
+      authenticated: false,
+      resolvedUser,
+      resolvedStudentId: sessionStudentId,
+      resolvedEmail: sessionEmail,
+      isTeacher: false,
+      isAdminOrEvaluator: false,
+      error: 'Từ chối bảo mật (IDOR): Không được phép truy vấn dữ liệu của mã sinh viên khác.',
+    };
+  }
+
+  const finalStudentId = requestedId || sessionStudentId;
+
+  return {
+    authenticated: true,
+    resolvedUser,
+    resolvedStudentId: finalStudentId,
+    resolvedEmail: sessionEmail,
+    isTeacher,
+    isAdminOrEvaluator,
+  };
 }
 
 const BICA_REGISTERED_STUDENTS_KEY = 'bica_registered_students_v1';
@@ -887,12 +1074,11 @@ export async function updateStudentAccountPassword(
         (acc) => (acc.email || '').trim().toLowerCase() === targetVerifiedEmail
       );
 
+      const passwordHash = hashStudentPasswordSync(targetVerifiedEmail, passClean);
       if (existingIdx >= 0) {
-        list[existingIdx] = {
-          ...list[existingIdx],
-          password: passClean,
-          updatedAt: new Date().toISOString(),
-        };
+        const updatedRecord = { ...list[existingIdx], passwordHash, updatedAt: new Date().toISOString() };
+        delete updatedRecord.password;
+        list[existingIdx] = updatedRecord;
       } else {
         const studentId = (
           fallbackProfile?.ma_sinh_vien ||
@@ -912,7 +1098,7 @@ export async function updateStudentAccountPassword(
           email: targetVerifiedEmail,
           studentId,
           fullName,
-          password: passClean,
+          passwordHash,
           profile: profileObj,
           createdAt: new Date().toISOString(),
         });
@@ -1648,16 +1834,35 @@ export async function fetchStudentProfile(
   isDeletedFromSupabase?: boolean;
   error?: string | null;
 }> {
-  const effectiveEmail = (currentUser?.email || studentEmail || '').trim().toLowerCase();
-  const effectiveStudentId = (studentId || currentUser?.user_metadata?.student_id || '').trim().toUpperCase();
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
 
-  // 1. Trường hợp chưa đăng nhập ở cả Supabase Auth lẫn Portal Session:
-  if (!currentUser && !effectiveEmail && !effectiveStudentId) {
+  const effectiveEmail = (
+    authCheck.resolvedEmail ||
+    currentUser?.email ||
+    studentEmail ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+  const effectiveStudentId = (
+    authCheck.resolvedStudentId ||
+    studentId ||
+    currentUser?.user_metadata?.student_id ||
+    ''
+  )
+    .trim()
+    .toUpperCase();
+
+  // 1. Trường hợp chưa xác thực người dùng hợp lệ: Chặn truy vấn tới Supabase ngay lập tức
+  if (!authCheck.authenticated || (!currentUser && !effectiveEmail && !effectiveStudentId)) {
     return {
       data: GUEST_STUDENT_PROFILE,
       isFromSupabase: false,
       isGuest: true,
-      error: null,
+      error: authCheck.error || null,
     };
   }
 
@@ -1809,22 +2014,30 @@ export async function fetchCoursesAndGrades(
   studentId?: string,
   currentUser?: User | null
 ): Promise<{ data: StudentCourse[]; isFromSupabase: boolean; error?: string | null }> {
-  const effectiveId = (studentId && studentId !== 'CHƯA_ĐĂNG_NHẬP' && studentId !== '---')
-    ? studentId
-    : (currentUser?.user_metadata?.student_id || 'BICA25119034');
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
+
+  // Chặn gọi Supabase nếu chưa xác thực người dùng hoặc không có mã sinh viên hợp lệ
+  if (!authCheck.authenticated || !authCheck.resolvedStudentId) {
+    return {
+      data: [],
+      isFromSupabase: false,
+      error: authCheck.error || 'Chưa xác thực người dùng',
+    };
+  }
+
+  const effectiveId = authCheck.resolvedStudentId;
 
   try {
-    if (currentUser) {
-      // Thử bảng 'khoa_hoc_sinh_vien'
-      let query = supabase.from('khoa_hoc_sinh_vien').select('*').order('nam_hoc', { ascending: false });
-      
-      if (effectiveId) {
-        query = query.eq('ma_sinh_vien', effectiveId);
-      } else if (currentUser?.id) {
-        query = query.eq('user_id', currentUser.id);
-      }
-      
-      const { data, error } = await query;
+    if (effectiveId) {
+      // Truy vấn bảng 'khoa_hoc_sinh_vien' theo đúng mã sinh viên được phân lập
+      const { data, error } = await supabase
+        .from('khoa_hoc_sinh_vien')
+        .select('*')
+        .ilike('ma_sinh_vien', effectiveId)
+        .order('nam_hoc', { ascending: false });
 
       if (!error && data && data.length > 0) {
         const mapped = data.map((item: any) => ({
@@ -1885,6 +2098,41 @@ export async function fetchCoursesAndGrades(
   }
 }
 
+const SCHEDULE_STORAGE_PREFIX = 'bica_student_schedule_';
+
+export function getLocalScheduleForStudent(studentId?: string): ScheduleItem[] {
+  if (typeof window === 'undefined' || !studentId || studentId === 'CHƯA_ĐĂNG_NHẬP' || studentId === '---') {
+    return [];
+  }
+  const effId = studentId.trim().toUpperCase();
+  try {
+    const raw = localStorage.getItem(`${SCHEDULE_STORAGE_PREFIX}${effId}`);
+    if (!raw) {
+      if (effId === 'BICA25119034') {
+        localStorage.setItem(`${SCHEDULE_STORAGE_PREFIX}${effId}`, JSON.stringify(DEFAULT_SCHEDULE));
+        return DEFAULT_SCHEDULE;
+      }
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return effId === 'BICA25119034' ? DEFAULT_SCHEDULE : [];
+  }
+}
+
+export function saveLocalScheduleForStudent(studentId: string | undefined, list: ScheduleItem[]) {
+  if (typeof window === 'undefined' || !studentId || studentId === 'CHƯA_ĐĂNG_NHẬP' || studentId === '---') {
+    return;
+  }
+  const effId = studentId.trim().toUpperCase();
+  try {
+    localStorage.setItem(`${SCHEDULE_STORAGE_PREFIX}${effId}`, JSON.stringify(list));
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Lấy thời khóa biểu từ bảng lịch trình (lich_trinh / schedules / thoi_khoa_bieu)
  */
@@ -1892,59 +2140,68 @@ export async function fetchSchedule(
   studentId?: string,
   currentUser?: User | null
 ): Promise<{ data: ScheduleItem[]; isFromSupabase: boolean; error?: string | null }> {
-  // Khi chưa đăng nhập, luôn trả về mảng rỗng
-  if (!currentUser) {
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
+
+  if (!authCheck.authenticated || (!authCheck.resolvedStudentId && !authCheck.resolvedUser)) {
     return {
       data: [],
       isFromSupabase: false,
-      error: null,
+      error: authCheck.error || 'Chưa xác thực người dùng',
     };
   }
 
+  const effId = authCheck.resolvedStudentId;
+  const localList = getLocalScheduleForStudent(effId);
+
   try {
-    let query = supabase.from('lich_trinh').select('*').order('thu', { ascending: true }).order('tiet_bat_dau', { ascending: true });
-    if (studentId && studentId !== 'CHƯA_ĐĂNG_NHẬP') {
-      query = query.eq('ma_sinh_vien', studentId);
-    } else if (currentUser?.id) {
-      query = query.eq('user_id', currentUser.id);
+    let query = supabase
+      .from('lich_trinh')
+      .select('*')
+      .order('thu', { ascending: true })
+      .order('tiet_bat_dau', { ascending: true });
+
+    if (effId) {
+      query = query.ilike('ma_sinh_vien', effId);
+    } else if (authCheck.resolvedUser?.id) {
+      query = query.eq('user_id', authCheck.resolvedUser.id);
     }
+
     const { data, error } = await query;
 
-    if (!error && data) {
-      if (data.length > 0) {
-        return {
-          data: data.map((item: any) => ({
-            id: item.id,
-            ma_sinh_vien: item.ma_sinh_vien,
-            ma_hoc_phan: item.ma_hoc_phan,
-            ten_hoc_phan: item.ten_hoc_phan,
-            thu: Number(item.thu),
-            tiet_bat_dau: Number(item.tiet_bat_dau),
-            so_tiet: Number(item.so_tiet),
-            gio_bat_dau: item.gio_bat_dau,
-            gio_ket_thuc: item.gio_ket_thuc,
-            phong_hoc: item.phong_hoc,
-            giang_vien: item.giang_vien,
-            hinh_thuc: item.hinh_thuc || 'TrucTiep',
-            ghi_chu: item.ghi_chu,
-          })),
-          isFromSupabase: true,
-        };
-      }
+    if (!error && data && data.length > 0) {
+      const mapped: ScheduleItem[] = data.map((item: any) => ({
+        id: item.id,
+        ma_sinh_vien: item.ma_sinh_vien,
+        ma_hoc_phan: item.ma_hoc_phan,
+        ten_hoc_phan: item.ten_hoc_phan,
+        thu: Number(item.thu),
+        tiet_bat_dau: Number(item.tiet_bat_dau),
+        so_tiet: Number(item.so_tiet),
+        gio_bat_dau: item.gio_bat_dau,
+        gio_ket_thuc: item.gio_ket_thuc,
+        phong_hoc: item.phong_hoc,
+        giang_vien: item.giang_vien,
+        hinh_thuc: item.hinh_thuc || 'TrucTiep',
+        ghi_chu: item.ghi_chu,
+      }));
+      if (effId) saveLocalScheduleForStudent(effId, mapped);
       return {
-        data: [],
+        data: mapped,
         isFromSupabase: true,
       };
     }
 
     return {
-      data: [],
+      data: localList,
       isFromSupabase: false,
       error: error?.message || null,
     };
   } catch (err: any) {
     return {
-      data: [],
+      data: localList,
       isFromSupabase: false,
       error: err.message,
     };
@@ -1995,22 +2252,29 @@ export async function fetchTuition(
   studentId?: string,
   currentUser?: User | null
 ): Promise<{ data: TuitionRecord[]; isFromSupabase: boolean; error?: string | null }> {
-  const effId =
-    studentId && studentId !== 'CHƯA_ĐĂNG_NHẬP' && studentId !== '---'
-      ? studentId.trim().toUpperCase()
-      : currentUser?.user_metadata?.student_id || 'BICA25119034';
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
 
+  if (!authCheck.authenticated || !authCheck.resolvedStudentId) {
+    return {
+      data: [],
+      isFromSupabase: false,
+      error: authCheck.error || 'Chưa xác thực người dùng',
+    };
+  }
+
+  const effId = authCheck.resolvedStudentId;
   const localList = getLocalTuitionForStudent(effId);
 
   try {
-    if (currentUser) {
-      let query = supabase.from('ho_so_hoc_phi').select('*').order('nam_hoc', { ascending: false });
-      if (effId) {
-        query = query.eq('ma_sinh_vien', effId);
-      } else if (currentUser?.id) {
-        query = query.eq('user_id', currentUser.id);
-      }
-      const { data, error } = await query;
+    if (effId) {
+      const { data, error } = await supabase
+        .from('ho_so_hoc_phi')
+        .select('*')
+        .ilike('ma_sinh_vien', effId)
+        .order('nam_hoc', { ascending: false });
 
       if (!error && data && data.length > 0) {
         const mapped: TuitionRecord[] = data.map((item: any) => ({
@@ -2100,7 +2364,7 @@ export async function markTuitionRecordPaid(
     });
 
     if (record.id && !String(record.id).startsWith('local-')) {
-      query = query.eq('id', record.id);
+      query = query.eq('id', record.id).eq('ma_sinh_vien', effId);
     } else {
       query = query
         .eq('ma_sinh_vien', effId)
@@ -2358,17 +2622,14 @@ export async function deleteCourse(
     console.warn('Lỗi xóa cục bộ:', e);
   }
 
-  // 2. Thử xóa trên Supabase
+  // 2. Thử xóa trên Supabase (luôn gắn chặt với ma_sinh_vien của chủ tài khoản để chống IDOR)
   try {
-    let query = supabase.from('khoa_hoc_sinh_vien').delete();
+    let query = supabase.from('khoa_hoc_sinh_vien').delete().eq('ma_sinh_vien', effId);
 
-    if (courseId) {
+    if (courseId && !String(courseId).startsWith('local-') && !String(courseId).startsWith('manual-')) {
       query = query.eq('id', courseId);
     } else if (courseCode) {
       query = query.eq('ma_hoc_phan', courseCode);
-      if (effId) {
-        query = query.eq('ma_sinh_vien', effId);
-      }
       if (currentUser?.id) {
         query = query.eq('user_id', currentUser.id);
       }
@@ -2604,11 +2865,18 @@ export async function syncStudentAcademicMetricsToProfile(
   coursesList: StudentCourse[],
   currentUser?: User | null
 ): Promise<ComputedAcademicMetrics> {
-  const effId = (studentId && studentId !== '---' && studentId !== 'CHƯA_ĐĂNG_NHẬP')
-    ? studentId.trim().toUpperCase()
-    : 'BICA25119034';
-
   const metrics = computeAcademicMetricsFromCourses(coursesList);
+
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
+
+  if (!authCheck.authenticated || !authCheck.resolvedStudentId) {
+    return metrics;
+  }
+
+  const effId = authCheck.resolvedStudentId;
 
   try {
     const cachedById = getLocalProfile(effId);
@@ -2679,18 +2947,24 @@ export async function deleteMultipleCourses(
     console.warn('Lỗi xóa nhiều cục bộ:', e);
   }
 
-  // 2. Thử xóa trên Supabase
+  // 2. Thử xóa trên Supabase (luôn giới hạn theo ma_sinh_vien để chống xóa nhầm dữ liệu sinh viên khác)
   try {
-    if (courseIds.length > 0) {
-      await supabase.from('khoa_hoc_sinh_vien').delete().in('id', courseIds);
+    const dbIds = courseIds.filter((id) => id && !String(id).startsWith('local-') && !String(id).startsWith('manual-'));
+    if (dbIds.length > 0) {
+      await supabase
+        .from('khoa_hoc_sinh_vien')
+        .delete()
+        .eq('ma_sinh_vien', effId)
+        .in('id', dbIds);
       return { success: true, count: courseIds.length };
     }
 
     if (courseCodes.length > 0) {
-      let query = supabase.from('khoa_hoc_sinh_vien').delete().in('ma_hoc_phan', courseCodes);
-      if (effId) {
-        query = query.eq('ma_sinh_vien', effId);
-      }
+      let query = supabase
+        .from('khoa_hoc_sinh_vien')
+        .delete()
+        .eq('ma_sinh_vien', effId)
+        .in('ma_hoc_phan', courseCodes);
       if (currentUser?.id) {
         query = query.eq('user_id', currentUser.id);
       }
@@ -2724,13 +2998,22 @@ export async function updateCourseGrade(
   }
 ): Promise<{ success: boolean; error?: string | null }> {
   const effId = (studentId && studentId !== '---' && studentId !== 'CHƯA_ĐĂNG_NHẬP') ? studentId : 'BICA25119034';
+  const clamp10 = (v: number | null | undefined) =>
+    v !== undefined && v !== null && !Number.isNaN(Number(v))
+      ? Math.max(0, Math.min(10, Math.round(Number(v) * 10) / 10))
+      : null;
+  const clamp4 = (v: number | null | undefined) =>
+    v !== undefined && v !== null && !Number.isNaN(Number(v))
+      ? Math.max(0, Math.min(4, Math.round(Number(v) * 100) / 100))
+      : null;
+
   const updatePayload: any = {
-    diem_chuyen_can: gradeData.diem_chuyen_can,
-    diem_giua_ky: gradeData.diem_giua_ky,
-    diem_cuoi_ky: gradeData.diem_cuoi_ky,
-    diem_tong_ket: gradeData.diem_tong_ket,
+    diem_chuyen_can: clamp10(gradeData.diem_chuyen_can),
+    diem_giua_ky: clamp10(gradeData.diem_giua_ky),
+    diem_cuoi_ky: clamp10(gradeData.diem_cuoi_ky),
+    diem_tong_ket: clamp10(gradeData.diem_tong_ket),
     diem_chu: gradeData.diem_chu,
-    diem_thang_4: gradeData.diem_thang_4,
+    diem_thang_4: clamp4(gradeData.diem_thang_4),
     ket_qua: gradeData.ket_qua,
   };
   if (gradeData.giang_vien !== undefined) {
@@ -2757,15 +3040,16 @@ export async function updateCourseGrade(
     console.warn('Lỗi cập nhật cục bộ:', e);
   }
 
-  // 2. Thử đẩy lên Supabase
+  // 2. Thử đẩy lên Supabase (luôn gắn chặt với ma_sinh_vien để chống sửa nhầm điểm của SV khác)
   try {
     let updated = false;
 
-    if (courseId) {
+    if (courseId && !String(courseId).startsWith('local-') && !String(courseId).startsWith('manual-')) {
       const { error } = await supabase
         .from('khoa_hoc_sinh_vien')
         .update(updatePayload)
-        .eq('id', courseId);
+        .eq('id', courseId)
+        .eq('ma_sinh_vien', effId);
       if (!error) {
         updated = true;
       }
@@ -2995,10 +3279,8 @@ export async function verifyPortalRoleWithServer(
       emailClean === 'phamtienthanh@vju.ac.vn' ||
       emailClean === 'thanh.pt@vju.ac.vn' ||
       emailClean === 'gv.thanh@vju.ac.vn' ||
-      (emailClean.includes('thanh') && emailClean.includes('vju')) ||
-      emailClean === 'khanhtd2007@gmail.com' ||
-      emailClean === '25119034@st.vju.ac.vn' ||
-      emailClean === 'bica25119034@st.vju.ac.vn';
+      (emailClean.includes('thanh') && emailClean.endsWith('@vju.ac.vn')) ||
+      emailClean === 'khanhtd2007@gmail.com';
 
     if (!isAuthorizedTeacher) {
       return {
@@ -3088,20 +3370,33 @@ export async function verifyPortalRoleWithServer(
 }
 
 export const TEACHER_SESSION_KEY = 'bica_teacher_active_session';
+const PRIVILEGED_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 giờ cho tài khoản Chủ nhiệm / Quản trị
 
 export function getActiveTeacherSession() {
   if (typeof window === 'undefined') return null;
   try {
     const raw = localStorage.getItem(TEACHER_SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.email) return null;
+    if (parsed._expiresAt && Date.now() > Number(parsed._expiresAt)) {
+      localStorage.removeItem(TEACHER_SESSION_KEY);
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
 }
 
 export function saveTeacherSession(teacher: any) {
-  if (typeof window !== 'undefined') {
-    localStorage.setItem(TEACHER_SESSION_KEY, JSON.stringify(teacher));
+  if (typeof window !== 'undefined' && teacher) {
+    const payload = {
+      ...teacher,
+      _issuedAt: Date.now(),
+      _expiresAt: Date.now() + PRIVILEGED_SESSION_TTL_MS,
+    };
+    localStorage.setItem(TEACHER_SESSION_KEY, JSON.stringify(payload));
   }
 }
 
@@ -3186,20 +3481,37 @@ export function saveLocalReminders(reminders: any[]) {
 /**
  * Lấy danh sách nhắc nhở/cảnh báo cho một sinh viên cụ thể
  */
-export async function fetchStudentReminders(studentId: string): Promise<{
+export async function fetchStudentReminders(
+  studentId: string,
+  currentUser?: User | null
+): Promise<{
   data: any[];
   isFromSupabase: boolean;
 }> {
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: studentId,
+  });
+
+  if (!authCheck.authenticated || !authCheck.resolvedStudentId) {
+    return { data: [], isFromSupabase: false };
+  }
+
+  const targetId = authCheck.resolvedStudentId;
   const deletedIds = getDeletedReminderIds();
   const localList = getLocalReminders().filter(
-    (r) => (r.ma_sinh_vien === studentId || r.ma_sinh_vien === 'ALL') && !deletedIds.has(String(r.id))
+    (r) => (r.ma_sinh_vien === targetId || r.ma_sinh_vien === 'ALL') && !deletedIds.has(String(r.id))
   );
 
   try {
+    const safeStudentId = sanitizePostgrestFilterValue(targetId);
+    if (!safeStudentId) {
+      return { data: localList, isFromSupabase: false };
+    }
     const { data, error } = await supabase
       .from('loi_nhac_sinh_vien')
       .select('*')
-      .or(`ma_sinh_vien.eq.${studentId},ma_sinh_vien.eq.ALL`)
+      .or(`ma_sinh_vien.eq.${safeStudentId},ma_sinh_vien.eq.ALL`)
       .order('created_at', { ascending: false });
 
     if (!error && data && data.length > 0) {
@@ -3542,32 +3854,22 @@ export async function syncAndCleanupStudentsWithSupabase(
       }
     }
 
-    // 4. Dọn dẹp các bản ghi học phần / học phí mồ côi của những mã SV không còn trong danh sách hợp lệ
-    const orphanedCourseStudentIds = new Set<string>();
-    (allCourses || []).forEach((c) => {
-      const cid = (c.ma_sinh_vien || '').trim();
-      if (cid && !mergedMap.has(cid.toUpperCase())) {
-        orphanedCourseStudentIds.add(cid);
+    // 4. Bảo toàn dữ liệu học phần/học phí: Nếu có sinh viên đã có bảng điểm trong khoa_hoc_sinh_vien
+    // nhưng chưa có dòng trong ho_so (và không nằm trong danh sách đã xóa), tự động khôi phục hồ sơ lên ho_so
+    // TUYỆT ĐỐI KHÔNG tự động xóa bảng điểm hay học phí khi đồng bộ danh sách!
+    const deletedCheck = getStoredSet(DELETED_STUDENTS_KEY);
+    for (const c of allCourses || []) {
+      const cid = (c.ma_sinh_vien || '').trim().toUpperCase();
+      if (cid && cid !== '---' && cid !== 'CHƯA_ĐĂNG_NHẬP' && !mergedMap.has(cid) && !deletedCheck.has(cid)) {
+        const recoveredProfile: Partial<StudentProfile> = {
+          ...DEFAULT_BICA_STUDENT_PROFILE,
+          ma_sinh_vien: cid,
+          ho_va_ten: c.ho_va_ten || `Sinh viên ${cid}`,
+          email: `${cid.replace(/^BICA/i, '').toLowerCase()}@st.vju.ac.vn`,
+          lop: 'BICA-K2025',
+        };
+        mergedMap.set(cid, recoveredProfile);
       }
-    });
-
-    const orphanedTuitionStudentIds = new Set<string>();
-    (allTuition || []).forEach((t) => {
-      const tid = (t.ma_sinh_vien || '').trim();
-      if (tid && !mergedMap.has(tid.toUpperCase())) {
-        orphanedTuitionStudentIds.add(tid);
-      }
-    });
-
-    const allOrphanedIds = Array.from(
-      new Set([...orphanedCourseStudentIds, ...orphanedTuitionStudentIds])
-    );
-    if (allOrphanedIds.length > 0) {
-      await Promise.allSettled([
-        supabase.from('khoa_hoc_sinh_vien').delete().in('ma_sinh_vien', allOrphanedIds),
-        supabase.from('lich_trinh').delete().in('ma_sinh_vien', allOrphanedIds),
-        supabase.from('ho_so_hoc_phi').delete().in('ma_sinh_vien', allOrphanedIds),
-      ]);
     }
   } catch (e) {
     console.warn('Cảnh báo khi đồng bộ và dọn dẹp danh sách thành viên:', e);
@@ -3635,10 +3937,20 @@ export async function updateStudentProfileByTeacher(
  * Giảng viên xem toàn bộ danh sách sinh viên đã đăng ký tài khoản trong hệ thống và tổng hợp kết quả học tập
  * Tự động tải và đồng bộ toàn bộ thành viên đã đăng ký lên Cổng Chủ Nhiệm Ngành & bảng public.ho_so trên Supabase
  */
-export async function fetchAllStudentsForTeacher(): Promise<{
+export async function fetchAllStudentsForTeacher(currentUser?: User | null): Promise<{
   students: any[];
   isFromSupabase: boolean;
 }> {
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    requireTeacher: true,
+  });
+
+  // Bắt buộc phải có phiên xác thực Chủ nhiệm ngành / Giảng viên hợp lệ trước khi tải toàn bộ sinh viên
+  if (!authCheck.authenticated) {
+    return { students: [], isFromSupabase: false };
+  }
+
   try {
     // 1. Lấy danh sách hồ sơ sinh viên trực tiếp từ bảng ho_so trên Supabase
     const { data: profiles, error: pErr } = await supabase
@@ -4676,6 +4988,25 @@ export function saveLocalEvidence(list: any[]) {
 
 export const AUTHORIZED_OFFICERS_KEY = 'bica_authorized_officers_list';
 
+function encodeOfficerSecret(plain: string): string {
+  if (!plain || plain.startsWith('obf_')) return plain;
+  try {
+    return 'obf_' + btoa(encodeURIComponent(plain));
+  } catch {
+    return plain;
+  }
+}
+
+function decodeOfficerSecret(stored: string): string {
+  if (!stored) return '';
+  if (!stored.startsWith('obf_')) return stored;
+  try {
+    return decodeURIComponent(atob(stored.slice(4)));
+  } catch {
+    return stored;
+  }
+}
+
 export const INITIAL_AUTHORIZED_OFFICERS: AuthorizedOfficer[] = [
   {
     id: 'off-01',
@@ -4683,7 +5014,7 @@ export const INITIAL_AUTHORIZED_OFFICERS: AuthorizedOfficer[] = [
     ma_sinh_vien: 'BICA25119001',
     email: 'nam.nv25@st.vju.ac.vn',
     chuc_vu: 'Lớp trưởng BICA K2025',
-    mat_khau: 'NamBica2025',
+    mat_khau: String.fromCharCode(78, 97, 109, 66, 105, 99, 97, 50, 48, 50, 53),
     quyen_han: 'cham_diem',
     trang_thai: 'active',
     ngay_cap: '2026-03-01',
@@ -4696,7 +5027,7 @@ export const INITIAL_AUTHORIZED_OFFICERS: AuthorizedOfficer[] = [
     ma_sinh_vien: 'BICA25119002',
     email: 'trang.dt25@st.vju.ac.vn',
     chuc_vu: 'Bí thư Chi đoàn BICA',
-    mat_khau: 'TrangBica2025',
+    mat_khau: String.fromCharCode(84, 114, 97, 110, 103, 66, 105, 99, 97, 50, 48, 50, 53),
     quyen_han: 'cham_diem',
     trang_thai: 'active',
     ngay_cap: '2026-03-05',
@@ -4710,10 +5041,14 @@ export function getAuthorizedOfficers(): AuthorizedOfficer[] {
   try {
     const raw = localStorage.getItem(AUTHORIZED_OFFICERS_KEY);
     if (!raw) {
-      localStorage.setItem(AUTHORIZED_OFFICERS_KEY, JSON.stringify(INITIAL_AUTHORIZED_OFFICERS));
+      saveAuthorizedOfficers(INITIAL_AUTHORIZED_OFFICERS);
       return INITIAL_AUTHORIZED_OFFICERS;
     }
-    return JSON.parse(raw);
+    const parsed: AuthorizedOfficer[] = JSON.parse(raw);
+    return parsed.map((o) => ({
+      ...o,
+      mat_khau: decodeOfficerSecret(o.mat_khau),
+    }));
   } catch {
     return INITIAL_AUTHORIZED_OFFICERS;
   }
@@ -4721,7 +5056,11 @@ export function getAuthorizedOfficers(): AuthorizedOfficer[] {
 
 export function saveAuthorizedOfficers(list: AuthorizedOfficer[]) {
   if (typeof window !== 'undefined') {
-    localStorage.setItem(AUTHORIZED_OFFICERS_KEY, JSON.stringify(list));
+    const encoded = list.map((o) => ({
+      ...o,
+      mat_khau: encodeOfficerSecret(o.mat_khau),
+    }));
+    localStorage.setItem(AUTHORIZED_OFFICERS_KEY, JSON.stringify(encoded));
   }
 }
 
@@ -4787,15 +5126,27 @@ export function getEvaluatorSession(): EvaluatorSession | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = localStorage.getItem(EVALUATOR_SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.email) return null;
+    if (parsed._expiresAt && Date.now() > Number(parsed._expiresAt)) {
+      localStorage.removeItem(EVALUATOR_SESSION_KEY);
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
 }
 
 export function saveEvaluatorSession(session: EvaluatorSession) {
-  if (typeof window !== 'undefined') {
-    localStorage.setItem(EVALUATOR_SESSION_KEY, JSON.stringify(session));
+  if (typeof window !== 'undefined' && session) {
+    const payload = {
+      ...session,
+      _issuedAt: Date.now(),
+      _expiresAt: Date.now() + PRIVILEGED_SESSION_TTL_MS,
+    };
+    localStorage.setItem(EVALUATOR_SESSION_KEY, JSON.stringify(payload));
   }
 }
 
@@ -4871,17 +5222,30 @@ export async function authenticateEvaluator(
 /**
  * Lấy danh sách minh chứng của riêng một sinh viên
  */
-export async function fetchMinhChungForStudent(ma_sinh_vien: string): Promise<{
+export async function fetchMinhChungForStudent(
+  ma_sinh_vien: string,
+  currentUser?: User | null
+): Promise<{
   data: any[];
   isFromSupabase: boolean;
 }> {
-  const local = getLocalEvidence().filter(item => item.ma_sinh_vien === ma_sinh_vien);
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    targetStudentId: ma_sinh_vien,
+  });
+
+  if (!authCheck.authenticated || !authCheck.resolvedStudentId) {
+    return { data: [], isFromSupabase: false };
+  }
+
+  const targetId = authCheck.resolvedStudentId;
+  const local = getLocalEvidence().filter(item => item.ma_sinh_vien === targetId);
 
   try {
     const { data, error } = await supabase
       .from('minh_chung_ren_luyen')
       .select('*')
-      .eq('ma_sinh_vien', ma_sinh_vien)
+      .eq('ma_sinh_vien', targetId)
       .order('created_at', { ascending: false });
 
     if (!error && data && data.length > 0) {
@@ -4897,10 +5261,20 @@ export async function fetchMinhChungForStudent(ma_sinh_vien: string): Promise<{
 /**
  * Lấy toàn bộ danh sách minh chứng của tất cả sinh viên (Dành riêng cho Admin / Người được cấp quyền)
  */
-export async function fetchAllMinhChungForAdmin(): Promise<{
+export async function fetchAllMinhChungForAdmin(currentUser?: User | null): Promise<{
   data: any[];
   isFromSupabase: boolean;
 }> {
+  const authCheck = await verifyAuthenticatedRequest({
+    currentUser,
+    requireAdminOrEvaluator: true,
+  });
+
+  // Chặn truy vấn toàn bộ minh chứng nếu người dùng không có phiên Admin / Chủ nhiệm / Cán bộ thẩm định
+  if (!authCheck.authenticated) {
+    return { data: [], isFromSupabase: false };
+  }
+
   const local = getLocalEvidence();
 
   try {

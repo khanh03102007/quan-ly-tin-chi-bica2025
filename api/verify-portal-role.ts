@@ -80,10 +80,8 @@ export default async function handler(req: any, res: any) {
       emailClean === 'phamtienthanh@vju.ac.vn' ||
       emailClean === 'thanh.pt@vju.ac.vn' ||
       emailClean === 'gv.thanh@vju.ac.vn' ||
-      (emailClean.includes('thanh') && emailClean.includes('vju')) ||
-      emailClean === 'khanhtd2007@gmail.com' ||
-      emailClean === '25119034@st.vju.ac.vn' ||
-      emailClean === 'bica25119034@st.vju.ac.vn';
+      (emailClean.includes('thanh') && emailClean.endsWith('@vju.ac.vn')) ||
+      emailClean === 'khanhtd2007@gmail.com';
 
     if (!isAuthorizedTeacher) {
       return res.status(401).json({

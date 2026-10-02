@@ -16,9 +16,12 @@ import {
   getActiveTeacherSession,
   saveTeacherSession,
   clearTeacherSession,
+  getEvaluatorSession,
+  clearEvaluatorSession,
   fetchAllStudentsForTeacher,
   fetchStudentReminders,
   fetchAllMinhChungForAdmin,
+  fetchMinhChungForStudent,
   getInitialRecoveryUrlState,
   computeAcademicMetricsFromCourses,
   syncStudentAcademicMetricsToProfile
@@ -61,7 +64,20 @@ export default function App() {
     if (getInitialRecoveryUrlState().isRecoveryRedirect) return null;
     try {
       const raw = localStorage.getItem(PORTAL_AUTH_KEY);
-      return raw ? JSON.parse(raw) : null;
+      if (!raw) return null;
+      const parsed: PortalAuthSession = JSON.parse(raw);
+      if (!parsed || !parsed.role || !parsed.email) return null;
+      const loginTime = parsed.loginAt ? new Date(parsed.loginAt).getTime() : 0;
+      const maxAgeMs = parsed.role === 'teacher' ? 12 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+      if (loginTime && Date.now() - loginTime > maxAgeMs) {
+        localStorage.removeItem(PORTAL_AUTH_KEY);
+        return null;
+      }
+      if (parsed.role === 'teacher' && !getActiveTeacherSession()) {
+        localStorage.removeItem(PORTAL_AUTH_KEY);
+        return null;
+      }
+      return parsed;
     } catch {
       return null;
     }
@@ -120,46 +136,119 @@ export default function App() {
   useEffect(() => {
     portalSessionRef.current = portalSession;
   }, [portalSession]);
-  // Ref kiểm soát tiến trình fetch để tránh nhiều request chạy chồng chéo
+  // Ref kiểm soát tiến trình fetch và bộ giới hạn tần suất request (Request Throttler)
   const isFetchingRef = useRef<boolean>(false);
+  const lastFetchTimestampRef = useRef<number>(0);
+  const lastFetchActorRef = useRef<string>('');
+  const LOAD_ALL_DATA_THROTTLE_MS = 3000; // Giới hạn tối소 3 giây giữa các lần tải lại dữ liệu cho cùng 1 phiên
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
   }, []);
 
-  // Tải danh sách tất cả sinh viên cho giảng viên
+  // Tải danh sách tất cả sinh viên cho giảng viên (Chỉ thực thi khi đã xác thực quyền Chủ nhiệm ngành / Giảng viên)
   const loadTeacherStudents = useCallback(async () => {
-    const res = await fetchAllStudentsForTeacher();
+    const isTeacherAuthenticated = Boolean(
+      getActiveTeacherSession() || portalSessionRef.current?.role === 'teacher'
+    );
+    if (!isTeacherAuthenticated) {
+      setAllStudents([]);
+      return;
+    }
+    const res = await fetchAllStudentsForTeacher(userRef.current);
     setAllStudents(res.students);
   }, []);
 
-  // Tải danh sách minh chứng điểm rèn luyện
-  const loadEvidence = useCallback(async () => {
-    const res = await fetchAllMinhChungForAdmin();
-    setAllEvidence(res.data);
-  }, []);
+  // Tải danh sách minh chứng điểm rèn luyện (Phân lập bảo mật: Kiểm tra xác thực trước khi gọi Supabase)
+  const loadEvidence = useCallback(async (targetStudentId?: string) => {
+    const hasAdminOrEvaluatorAccess = Boolean(getActiveTeacherSession() || getEvaluatorSession());
+    if (hasAdminOrEvaluatorAccess) {
+      const res = await fetchAllMinhChungForAdmin(userRef.current);
+      setAllEvidence(res.data);
+      return;
+    }
+    const activePortal = portalSessionRef.current;
+    const currentUser = userRef.current;
+    if (!currentUser && !activePortal) {
+      setAllEvidence([]);
+      return;
+    }
+    const sid = targetStudentId || activePortal?.studentId || profile.ma_sinh_vien;
+    if (sid && sid !== '---' && sid !== 'CHƯA_ĐĂNG_NHẬP') {
+      const res = await fetchMinhChungForStudent(sid, currentUser);
+      setAllEvidence(res.data);
+    } else {
+      setAllEvidence([]);
+    }
+  }, [profile.ma_sinh_vien]);
 
-  // Tải lời nhắc/cảnh báo học vụ cho sinh viên hiện tại
+  // Tải lời nhắc/cảnh báo học vụ cho sinh viên hiện tại (Yêu cầu đã xác thực)
   const loadRemindersForStudent = useCallback(async (studentId: string) => {
-    const res = await fetchStudentReminders(studentId);
+    const currentUser = userRef.current;
+    const activePortal = portalSessionRef.current;
+    if ((!currentUser && !activePortal) || !studentId || studentId === '---' || studentId === 'CHƯA_ĐĂNG_NHẬP') {
+      setReminders([]);
+      return;
+    }
+    const res = await fetchStudentReminders(studentId, currentUser);
     setReminders(res.data);
   }, []);
 
   // Hàm tải toàn bộ dữ liệu từ Supabase theo đúng tài khoản người dùng đang đăng nhập
-  const loadAllData = useCallback(async (targetUser?: User | null) => {
+  const loadAllData = useCallback(async (targetUser?: User | null, options?: { force?: boolean }) => {
     if (isFetchingRef.current) return;
+
+    // Tránh trường hợp sự kiện onClick truyền thẳng SyntheticEvent vào tham số đầu tiên
+    const normalizedTargetUser =
+      targetUser && typeof targetUser === 'object' && 'nativeEvent' in (targetUser as any)
+        ? undefined
+        : targetUser;
+
+    // 1. Kiểm tra xác thực người dùng (Authenticated User Guard) TRƯỚC khi gọi tới Supabase
+    const currentUser = normalizedTargetUser !== undefined ? normalizedTargetUser : userRef.current;
+    const activePortal = portalSessionRef.current;
+    const activeTeacherSession = getActiveTeacherSession();
+    const isAuthenticated = Boolean(currentUser || activePortal || activeTeacherSession);
+
+    if (!isAuthenticated) {
+      lastFetchTimestampRef.current = 0;
+      lastFetchActorRef.current = '';
+      setProfile(DEFAULT_STUDENT_PROFILE);
+      setCourses([]);
+      setSchedule([]);
+      setTuition([]);
+      setReminders([]);
+      setAllStudents([]);
+      setAllEvidence([]);
+      setIsSupabaseLive(false);
+      return;
+    }
+
+    // 1b. Request Throttler: Ngăn chặn gửi quá nhiều request lên Supabase khi làm mới liên tục trên Dashboard
+    const currentActorKey =
+      currentUser?.id ||
+      activePortal?.studentId ||
+      activePortal?.email ||
+      activeTeacherSession?.email ||
+      'authenticated';
+    const now = Date.now();
+    const isSameActor = lastFetchActorRef.current === currentActorKey;
+
+    if (!options?.force && isSameActor && now - lastFetchTimestampRef.current < LOAD_ALL_DATA_THROTTLE_MS) {
+      return;
+    }
+
+    lastFetchTimestampRef.current = now;
+    lastFetchActorRef.current = currentActorKey;
     isFetchingRef.current = true;
     setIsRefreshing(true);
 
     try {
-      // 1. Xác định tài khoản hiện tại từ tham số hoặc ref ổn định
-      const currentUser = targetUser !== undefined ? targetUser : userRef.current;
-      const activePortal = portalSessionRef.current;
       const fallbackStudentId = activePortal?.role === 'student' ? activePortal.studentId : undefined;
       const fallbackEmail = activePortal?.role === 'student' ? activePortal.email : undefined;
 
-      // 2. Lấy hồ sơ của riêng tài khoản này
+      // 2. Lấy hồ sơ của riêng tài khoản đã xác thực này
       const profileRes = await fetchStudentProfile(currentUser, fallbackStudentId, fallbackEmail);
 
       // Nếu tài khoản sinh viên đang đăng nhập nhưng hồ sơ đã bị xóa khỏi Supabase
@@ -175,15 +264,16 @@ export default function App() {
       }
 
       const studentId = profileRes.data.ma_sinh_vien;
+      const isTeacherPortal = Boolean(getActiveTeacherSession() || activePortal?.role === 'teacher');
 
-      // 3. Lấy các bảng liên kết theo mã sinh viên và user_id của tài khoản
+      // 3. Lấy các bảng liên kết theo mã sinh viên và phân lập quyền truy cập dữ liệu lớp
       const [coursesRes, scheduleRes, tuitionRes] = await Promise.all([
         fetchCoursesAndGrades(studentId, currentUser),
         fetchSchedule(studentId, currentUser),
         fetchTuition(studentId, currentUser),
         loadRemindersForStudent(studentId),
-        loadTeacherStudents(),
-        loadEvidence(),
+        isTeacherPortal ? loadTeacherStudents() : Promise.resolve(),
+        loadEvidence(studentId),
       ]);
 
       const computedMetrics = computeAcademicMetricsFromCourses(coursesRes.data);
@@ -267,10 +357,14 @@ export default function App() {
       }
     });
 
-    // 3. Lắng nghe thay đổi Realtime từ Supabase (có debounce chống giật màn hình)
+    // 3. Lắng nghe thay đổi Realtime từ Supabase (Chỉ kích hoạt làm mới khi người dùng đã xác thực)
     let debounceTimer: any = null;
     const unsubscribeRealtime = subscribeToRealtimeChanges((tableName) => {
       if (!isMounted) return;
+      const hasActiveAuth = Boolean(
+        userRef.current || portalSessionRef.current || getActiveTeacherSession()
+      );
+      if (!hasActiveAuth) return;
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
         showToast(`⚡ Nhận cập nhật Realtime từ bảng [${tableName}]`);
@@ -288,8 +382,11 @@ export default function App() {
 
   const handleSignOut = async () => {
     await signOut();
+    clearTeacherSession();
+    clearEvaluatorSession();
     userRef.current = null;
     setUser(null);
+    setAllStudents([]);
     loadAllData(null);
   };
 
@@ -330,7 +427,6 @@ export default function App() {
     setCurrentTab('profile');
     showToast(`Chào mừng sinh viên ${prof.ho_va_ten} (${prof.ma_sinh_vien}) đã đăng nhập`);
     loadAllData(authUser);
-    loadTeacherStudents();
   };
 
   // Xử lý đăng nhập thành công Cổng Chủ Nhiệm Ngành từ Gateway (DẪN THẲNG ĐẾN CỔNG CỐ VẤN / KHOA)
@@ -355,11 +451,16 @@ export default function App() {
   // Đăng xuất toàn bộ phiên làm việc của Cổng
   const handleGatewayLogout = () => {
     localStorage.removeItem(PORTAL_AUTH_KEY);
+    portalSessionRef.current = null;
     setPortalSession(null);
     setActiveTeacher(null);
     clearTeacherSession();
+    clearEvaluatorSession();
+    setAllStudents([]);
+    setAllEvidence([]);
     userRef.current = null;
     setUser(null);
+    signOut().catch(() => {});
     showToast('Đã đăng xuất và khóa cổng bảo mật. Vui lòng đăng nhập lại để tiếp tục.');
   };
 

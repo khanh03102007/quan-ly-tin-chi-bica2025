@@ -340,6 +340,7 @@ export const StudyPortalTab: React.FC<StudyPortalTabProps> = ({
       setAdminEmailInput('');
       setAdminAccessCode('');
       setAdminAuthError(null);
+      onEvidenceChanged();
     } else {
       setAdminAuthError(
         result.error ||
@@ -351,6 +352,7 @@ export const StudyPortalTab: React.FC<StudyPortalTabProps> = ({
   const handleLogoutEvaluator = () => {
     setEvaluator(null);
     clearEvaluatorSession();
+    onEvidenceChanged();
   };
 
   // Mở modal chấm điểm duyệt

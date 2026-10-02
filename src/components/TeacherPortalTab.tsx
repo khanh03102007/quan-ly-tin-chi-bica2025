@@ -223,6 +223,15 @@ export const TeacherPortalTab: React.FC<TeacherPortalTabProps> = ({
 
   const handleExportStudentsCsv = () => {
     if (!allStudents || allStudents.length === 0) return;
+    // Chống lỗ hổng CSV Formula Injection (khi mở bằng Microsoft Excel) & escape dấu ngoặc kép
+    const safeCsvCell = (rawVal: any): string => {
+      let str = String(rawVal ?? '').replace(/"/g, '""').trim();
+      if (/^[=+\-@\t\r]/.test(str)) {
+        str = `'${str}`;
+      }
+      return `"${str}"`;
+    };
+
     const headers = [
       'STT',
       'Mã Sinh Viên',
@@ -247,18 +256,18 @@ export const TeacherPortalTab: React.FC<TeacherPortalTabProps> = ({
         : 'Đã kích hoạt';
       return [
         idx + 1,
-        `"${st.ma_sinh_vien || ''}"`,
-        `"${st.ho_va_ten || ''}"`,
-        `"${st.lop || 'BICA-K2025'}"`,
-        `"${st.email || ''}"`,
-        `"${st.so_dien_thoai || ''}"`,
+        safeCsvCell(st.ma_sinh_vien || ''),
+        safeCsvCell(st.ho_va_ten || ''),
+        safeCsvCell(st.lop || 'BICA-K2025'),
+        safeCsvCell(st.email || ''),
+        safeCsvCell(st.so_dien_thoai || ''),
         credits,
         st.courses_count || 0,
         gpa,
-        `"${st.xep_loai || 'Bình thường'}"`,
-        `"${st.trang_thai_hoc_tap || 'Đang theo học'}"`,
+        safeCsvCell(st.xep_loai || 'Bình thường'),
+        safeCsvCell(st.trang_thai_hoc_tap || 'Đang theo học'),
         debt,
-        `"${createdDate}"`,
+        safeCsvCell(createdDate),
       ].join(',');
     });
     const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\n');

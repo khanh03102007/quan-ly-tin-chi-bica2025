@@ -6,7 +6,6 @@ import {
   LogOut,
   LogIn,
   RefreshCw,
-  Download,
   ShieldCheck,
   Globe,
   DoorOpen,
@@ -133,18 +132,6 @@ export const Header: React.FC<HeaderProps> = ({
                 {portalSession || user ? (isSupabaseLive ? 'CSDL Trực Tuyến' : 'Đã Xác Thực') : 'Chưa đăng nhập'}
               </span>
             </div>
-
-            {/* Source code archive download */}
-            <a
-              id="btn-download-source-zip"
-              href="/app-source-code.zip"
-              download="portal-sv02-bica-vju.zip"
-              className="hidden lg:inline-flex items-center space-x-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-md transition-colors"
-              title="Tải gói sao lưu mã nguồn portal (.zip)"
-            >
-              <Download className="w-3.5 h-3.5 text-slate-500" />
-              <span>Mã nguồn</span>
-            </a>
 
             {/* Sync refresh button */}
             <button
