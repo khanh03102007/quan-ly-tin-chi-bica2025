@@ -13,6 +13,95 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   const app = express();
   const port = process.env.PORT || 3000;
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  // 1. Ép buộc chuyển hướng HTTP -> HTTPS trên Production & thiết lập Security Headers
+  app.use((req, res, next) => {
+    const proto = req.headers['x-forwarded-proto'];
+    if (isProduction && proto && proto !== 'https' && !req.hostname.includes('localhost')) {
+      return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+    }
+
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    if (isProduction) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
+
+  // 2. Cấu hình CORS theo Whitelist (bao gồm cả non-www, www, APP_URL và môi trường preview)
+  const allowedOrigins = new Set(
+    [
+      'https://sv02.bica-vju.com',
+      'https://www.sv02.bica-vju.com',
+      process.env.APP_URL,
+      ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : []),
+    ]
+      .map((o) => (o || '').trim().replace(/\/$/, ''))
+      .filter(Boolean)
+  );
+
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin?.replace(/\/$/, '');
+    const isAllowedOrigin =
+      !origin ||
+      allowedOrigins.has(origin) ||
+      origin.endsWith('.run.app') ||
+      origin.endsWith('.vercel.app') ||
+      origin.startsWith('http://localhost:') ||
+      origin.startsWith('http://127.0.0.1:');
+
+    if (origin && isAllowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    }
+
+    if (req.method === 'OPTIONS') {
+      return isAllowedOrigin ? res.status(204).end() : res.status(403).json({ success: false, error: 'CORS Forbidden' });
+    }
+
+    if (origin && !isAllowedOrigin) {
+      return res.status(403).json({ success: false, error: 'Origin không được phép truy cập API.' });
+    }
+
+    next();
+  });
+
+  // 3. Bộ giới hạn tần suất (Rate Limiting) cho các API AI nặng (Tối đa 15 requests / phút / IP)
+  const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+  const RATE_LIMIT_MAX_REQUESTS = 15;
+
+  function apiRateLimiter(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const clientIp = String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
+    const now = Date.now();
+    const record = rateLimitMap.get(clientIp);
+
+    if (!record || now > record.resetAt) {
+      rateLimitMap.set(clientIp, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+      return next();
+    }
+
+    if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
+      const retryAfterSec = Math.ceil((record.resetAt - now) / 1000);
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        success: false,
+        error: `Bạn đã gửi quá nhiều yêu cầu quét điểm. Vui lòng thử lại sau ${retryAfterSec} giây.`,
+      });
+    }
+
+    record.count += 1;
+    next();
+  }
 
   // Tăng payload limit để nhận ảnh chụp bảng điểm độ phân giải cao và tài liệu PDF
   app.use(express.json({ limit: '35mb' }));
@@ -98,20 +187,194 @@ async function startServer() {
     throw lastError;
   }
 
+  const ALLOWED_MIME_TYPES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/webp',
+    'application/pdf',
+  ]);
+
+  // Bộ giới hạn tần suất riêng cho xác thực mật khẩu phân quyền (chống Brute-force: tối đa 10 lần/phút/IP)
+  const authRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  function authRateLimiter(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const clientIp = String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
+    const now = Date.now();
+    const record = authRateLimitMap.get(clientIp);
+
+    if (!record || now > record.resetAt) {
+      authRateLimitMap.set(clientIp, { count: 1, resetAt: now + 60 * 1000 });
+      return next();
+    }
+
+    if (record.count >= 10) {
+      const retryAfterSec = Math.ceil((record.resetAt - now) / 1000);
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        success: false,
+        error: `Bạn đã thử đăng nhập quá nhiều lần. Vui lòng thử lại sau ${retryAfterSec} giây.`,
+      });
+    }
+
+    record.count += 1;
+    next();
+  }
+
+  // API Xác thực mật khẩu phân quyền ở phía Server (không lưu mật khẩu cứng ở Client Bundle)
+  app.post('/api/verify-portal-role', authRateLimiter, (req, res) => {
+    const { portalType, email, password } = req.body || {};
+    const emailClean = typeof email === 'string' ? email.trim().toLowerCase().slice(0, 120) : '';
+    const passClean = typeof password === 'string' ? password.trim().slice(0, 120) : '';
+    const masterPassword = process.env.PORTAL_MASTER_PASSWORD || 'Bica2025';
+
+    if (!emailClean || !passClean) {
+      return res.status(400).json({
+        success: false,
+        error: 'Vui lòng nhập đầy đủ tài khoản email và mật khẩu.',
+      });
+    }
+
+    if (portalType === 'teacher') {
+      const isAuthorizedTeacher =
+        emailClean === 'phamtienthanh@vju.ac.vn' ||
+        emailClean === 'thanh.pt@vju.ac.vn' ||
+        emailClean === 'gv.thanh@vju.ac.vn' ||
+        (emailClean.includes('thanh') && emailClean.includes('vju')) ||
+        emailClean === 'khanhtd2007@gmail.com' ||
+        emailClean === '25119034@st.vju.ac.vn' ||
+        emailClean === 'bica25119034@st.vju.ac.vn';
+
+      if (!isAuthorizedTeacher) {
+        return res.status(401).json({
+          success: false,
+          error: 'Email không tồn tại trong danh sách tài khoản Chủ nhiệm ngành được cấp quyền.',
+        });
+      }
+
+      if (passClean !== masterPassword) {
+        return res.status(401).json({
+          success: false,
+          error: 'Mật khẩu phân quyền không chính xác. Vui lòng nhập đúng mật khẩu được cấp.',
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        teacher: {
+          email: 'phamtienthanh@vju.ac.vn',
+          ho_va_ten: 'TS. Phạm Tiến Thành',
+          ma_giang_vien: 'GV-BICA-TRUONGNGANH',
+          khoa_vien: 'Chương trình Kỹ thuật Thông minh & Tự động hóa (BICA - VJU)',
+          vai_tro: 'truong_nganh',
+        },
+      });
+    }
+
+    if (portalType === 'evaluator') {
+      if (emailClean === 'khanhtd2007@gmail.com') {
+        if (passClean === masterPassword) {
+          return res.status(200).json({
+            success: true,
+            session: {
+              name: 'Trần Duy Khánh (Admin Web)',
+              role: 'Quản Trị Viên Hệ Thống (Super Admin)',
+              email: 'khanhtd2007@gmail.com',
+              isSuperAdmin: true,
+              quyen_han: 'toan_quyen',
+            },
+          });
+        }
+        return res.status(401).json({
+          success: false,
+          error: 'Mật khẩu Quản trị viên không chính xác. Vui lòng kiểm tra lại.',
+        });
+      }
+
+      const isTeacherAccount =
+        emailClean === 'phamtienthanh@vju.ac.vn' ||
+        emailClean === 'thanh.pt@vju.ac.vn' ||
+        emailClean === 'gv.thanh@vju.ac.vn';
+
+      if (isTeacherAccount) {
+        if (passClean === masterPassword) {
+          return res.status(200).json({
+            success: true,
+            session: {
+              name: 'TS. Phạm Tiến Thành (Chủ nhiệm ngành)',
+              role: 'Chủ nhiệm ngành BICA',
+              email: emailClean,
+              isSuperAdmin: false,
+              quyen_han: 'toan_quyen',
+            },
+          });
+        }
+        return res.status(401).json({
+          success: false,
+          error: 'Mật khẩu tài khoản Chủ nhiệm ngành không chính xác.',
+        });
+      }
+
+      return res.status(200).json({
+        success: false,
+        isNotServerAccount: true,
+      });
+    }
+
+    if (portalType === 'default_student') {
+      const isDefaultStudentEmail =
+        emailClean === '25119034@st.vju.ac.vn' ||
+        emailClean === 'bica25119034@st.vju.ac.vn' ||
+        emailClean === 'khanhtd@st.vju.ac.vn';
+
+      if (isDefaultStudentEmail && passClean === masterPassword) {
+        return res.status(200).json({ success: true });
+      }
+      return res.status(401).json({
+        success: false,
+        error: 'Email trường hoặc mật khẩu không chính xác.',
+      });
+    }
+
+    return res.status(400).json({ success: false, error: 'Loại cổng xác thực không hợp lệ.' });
+  });
+
   // API Quét & Bóc tách bảng điểm từ Hình ảnh / PDF / Văn bản trích xuất
-  app.post('/api/scan-grades', async (req, res) => {
+  app.post('/api/scan-grades', apiRateLimiter, async (req, res) => {
     try {
-      const { fileType, base64Data, textContent, targetStudentId } = req.body;
+      const { fileType, base64Data, textContent, targetStudentId } = req.body || {};
 
       if (!base64Data && !textContent) {
         return res.status(400).json({ success: false, error: 'Thiếu dữ liệu tệp hoặc văn bản' });
       }
 
+      // Validate & Sanitize đầu vào để chống XSS, DoS và Prompt Injection
+      const cleanFileType = typeof fileType === 'string' ? fileType.trim().toLowerCase() : '';
+      if (base64Data && cleanFileType && !ALLOWED_MIME_TYPES.has(cleanFileType)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Định dạng tệp không hợp lệ. Chỉ chấp nhận PNG, JPG, WEBP hoặc PDF.',
+        });
+      }
+
+      if (base64Data && (typeof base64Data !== 'string' || base64Data.length > 45_000_000)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Dữ liệu tệp tải lên vượt quá kích thước cho phép.',
+        });
+      }
+
+      const sanitizedTextContent =
+        typeof textContent === 'string' ? textContent.slice(0, 200_000) : '';
+      const sanitizedTargetStudentId =
+        typeof targetStudentId === 'string'
+          ? targetStudentId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
+          : '';
+
       const promptInstruction = `Bạn là Trợ lý Học vụ Thông minh của Trường Đại học Việt Nhật (VJU - ĐHQGHN), chuyên trách chương trình Cử nhân Kỹ thuật Thông minh và Tự động hóa (BICA 2025).
 Nhiệm vụ của bạn là đọc kỹ bảng điểm, phiếu điểm, sổ điểm hoặc tài liệu được gửi tới và trích xuất dữ liệu học phần thật chính xác.
 
 YÊU CẦU TRÍCH XUẤT:
-1. "ma_sinh_vien": Mã sinh viên ghi trong tài liệu (ví dụ: BICA25119034, 25119034, BICA25119001...). Nếu trong tài liệu không có hoặc khó đọc, hãy trả về "${targetStudentId || ''}".
+1. "ma_sinh_vien": Mã sinh viên ghi trong tài liệu (ví dụ: BICA25119034, 25119034, BICA25119001...). Nếu trong tài liệu không có hoặc khó đọc, hãy trả về "${sanitizedTargetStudentId}".
 2. "ho_va_ten": Họ và tên sinh viên (nếu có trong bảng điểm).
 3. "hoc_ky": Học kỳ hoặc năm học ghi nhận (ví dụ: "Học kỳ 1", "Học kỳ 2", "2025-2026").
 4. "courses": Danh sách tất cả học phần/môn học có trong bảng điểm. Mỗi môn học bao gồm:
@@ -145,22 +408,22 @@ YÊU CẦU TRÍCH XUẤT:
    - "giang_vien": Tên giảng viên phụ trách nếu có ghi.
    - "ghi_chu": Ghi chú thêm nếu có.
 
-Ưu tiên trích xuất chính xác các dòng bảng điểm của sinh viên mang mã "${targetStudentId || ''}".`;
+Ưu tiên trích xuất chính xác các dòng bảng điểm của sinh viên mang mã "${sanitizedTargetStudentId}".`;
 
       const contents: any[] = [];
 
-      if (base64Data && fileType) {
+      if (base64Data && cleanFileType) {
         // Hỗ trợ ảnh (image/png, image/jpeg, image/webp) hoặc PDF (application/pdf)
         contents.push({
           inlineData: {
-            mimeType: fileType,
+            mimeType: cleanFileType,
             data: base64Data,
           },
         });
         contents.push(promptInstruction);
-      } else if (textContent) {
+      } else if (sanitizedTextContent) {
         // Dữ liệu văn bản từ Word hoặc Excel / PDF trích xuất text
-        contents.push(promptInstruction + '\n\n=== NỘI DUNG VĂN BẢN BẢNG ĐIỂM ===\n' + textContent);
+        contents.push(promptInstruction + '\n\n=== NỘI DUNG VĂN BẢN BẢNG ĐIỂM ===\n' + sanitizedTextContent);
       }
 
       const schemaConfig = {
@@ -215,31 +478,66 @@ YÊU CẦU TRÍCH XUẤT:
       } else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) {
         userFriendlyError =
           'Đã đạt hạn mức yêu cầu tạm thời (429). Vui lòng chờ 10-15 giây rồi thử lại, hoặc nhập điểm qua file Excel.';
-      } else if (err?.message) {
+      } else if (!isProduction && err?.message) {
         userFriendlyError = err.message;
       }
 
       return res.status(503).json({
         success: false,
         error: userFriendlyError,
-        rawError: rawMsg,
+        ...(isProduction ? {} : { rawError: rawMsg }),
       });
     }
   });
 
-  // Gắn kết Vite middleware trong môi trường Dev, hoặc serve dist trong Production
-  if (process.env.NODE_ENV !== 'production') {
+  // 4. Xử lý 404 chuẩn cho các API endpoint không tồn tại
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({
+      success: false,
+      error: `API endpoint không tồn tại: ${req.method} ${req.originalUrl}`,
+    });
+  });
+
+  // Gắn kết Vite middleware trong môi trường Dev, hoặc serve dist có Caching trong Production
+  if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
+    app.use(
+      '/assets',
+      express.static(path.resolve(__dirname, 'dist', 'assets'), {
+        maxAge: '1y',
+        immutable: true,
+      })
+    );
+    app.use(
+      express.static(path.resolve(__dirname, 'dist'), {
+        maxAge: '1h',
+      })
+    );
     app.get('*', (req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
+
+  // 5. Global Error Handler (500 Internal Server Error / PayloadTooLarge)
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({
+        success: false,
+        error: 'Kích thước dữ liệu gửi lên vượt quá giới hạn tối đa (35MB).',
+      });
+    }
+    console.error('Unhandled Server Error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Lỗi hệ thống máy chủ nội bộ (500). Vui lòng thử lại sau.',
+    });
+  });
 
   app.listen(port, () => {
     console.log(`BICA Portal Server running at http://localhost:${port}`);
