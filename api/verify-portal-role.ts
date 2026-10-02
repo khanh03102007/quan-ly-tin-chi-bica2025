@@ -6,6 +6,7 @@ export default async function handler(req: any, res: any) {
   const origin = String(req.headers?.origin || '').replace(/\/$/, '');
   const allowedOrigins = new Set(
     [
+      'https://quan-ly-tin-chi-bica.vercel.app',
       'https://sv02.bica-vju.com',
       'https://www.sv02.bica-vju.com',
       process.env.APP_URL,

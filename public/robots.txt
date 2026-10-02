@@ -2,4 +2,4 @@ User-agent: *
 Allow: /
 Disallow: /api/
 
-Sitemap: https://sv02.bica-vju.com/sitemap.xml
+Sitemap: https://quan-ly-tin-chi-bica.vercel.app/sitemap.xml

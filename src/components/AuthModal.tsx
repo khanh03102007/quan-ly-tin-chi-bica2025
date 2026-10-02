@@ -123,7 +123,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         email: cleanEmail,
       });
       setLoading(false);
-      if (error && !data?.hoSoSynced) {
+      if (error && !(data as any)?.hoSoSynced) {
         setErrorMessage(error);
       } else {
         setSuccessMessage(

@@ -987,7 +987,7 @@ export async function consumeInitialRecoveryRedirect(): Promise<{
       };
     }
     const verifiedUser = data.user;
-    const verifiedEmail = verifiedUser.email.trim().toLowerCase();
+    const verifiedEmail = (verifiedUser.email || '').trim().toLowerCase();
     const recoverySentAt = (verifiedUser as any).recovery_sent_at as string | undefined;
     const instanceKey = recoverySentAt
       ? `recovery_instance:${verifiedUser.id}:${recoverySentAt}`
@@ -1056,7 +1056,7 @@ export async function consumeInitialRecoveryRedirect(): Promise<{
       };
     }
     const verifiedUser = data.user;
-    const verifiedEmail = verifiedUser.email.trim().toLowerCase();
+    const verifiedEmail = (verifiedUser.email || '').trim().toLowerCase();
     const recoverySentAt = (verifiedUser as any).recovery_sent_at as string | undefined;
     const instanceKey = recoverySentAt
       ? `recovery_instance:${verifiedUser.id}:${recoverySentAt}`
@@ -1385,7 +1385,7 @@ export async function verifyGmailRecoveryLinkOrOtp(
       }
 
       const verifiedUser = userRes.user;
-      const verifiedEmail = verifiedUser.email.trim().toLowerCase();
+      const verifiedEmail = (verifiedUser.email || '').trim().toLowerCase();
 
       // Ràng buộc tài khoản: Link của tài khoản A chỉ dùng được cho tài khoản A
       if (verifiedEmail !== emailClean) {
@@ -1496,7 +1496,7 @@ export async function verifyGmailRecoveryLinkOrOtp(
 
     if (!hashErr && hashData?.user?.email) {
       const verifiedUser = hashData.user;
-      const verifiedEmail = verifiedUser.email.trim().toLowerCase();
+      const verifiedEmail = (verifiedUser.email || '').trim().toLowerCase();
 
       // Ràng buộc tài khoản nghiêm ngặt: Mã của tài khoản A chỉ dùng được cho tài khoản A!
       // Lưu ý: Nếu user nhập sai email trên màn hình (ví dụ nhập B nhưng dán link của A),
@@ -3302,7 +3302,7 @@ export async function deleteStudentAccountFromSupabase(
 
   try {
     // 1. Xóa trên các bảng dữ liệu Supabase
-    const tasks: Promise<any>[] = [
+    const tasks: PromiseLike<any>[] = [
       supabase.from('ho_so').delete().eq('ma_sinh_vien', cleanId),
       supabase.from('khoa_hoc_sinh_vien').delete().eq('ma_sinh_vien', cleanId),
       supabase.from('lich_trinh').delete().eq('ma_sinh_vien', cleanId),

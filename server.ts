@@ -37,6 +37,7 @@ async function startServer() {
   // 2. Cấu hình CORS theo Whitelist (bao gồm cả non-www, www, APP_URL và môi trường preview)
   const allowedOrigins = new Set(
     [
+      'https://quan-ly-tin-chi-bica.vercel.app',
       'https://sv02.bica-vju.com',
       'https://www.sv02.bica-vju.com',
       process.env.APP_URL,
